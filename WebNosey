@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+Nosey - Website Vulnerability Scanner
+Scans websites for common security vulnerabilities and generates human-readable reports.
+"""
+
+import requests
+import socket
+import ssl
+import re
+import sys
+import os
+from urllib.parse import urlparse
+from datetime import datetime
+import json
+
+class VulnerabilityScanner:
+    def __init__(self, url):
+        """Initialize scanner with target URL."""
+        self.url = url
+        self.parsed_url = urlparse(url)
+        self.domain = self.parsed_url.netloc
+        self.vulnerabilities = []
+        self.warnings = []
+        self.info = []
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def scan(self):
+        """Run all vulnerability checks."""
+        print("\n" + "=" * 70)
+        print("NOSEY VULNERABILITY SCANNER - DEEP ANALYSIS")
+        print("=" * 70)
+        print(f"Target: {self.url}")
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70 + "\n")
+        
+        print("Performing comprehensive vulnerability scan...\n")
+        
+        # Run all checks
+        self.check_ssl_tls()
+        self.check_security_headers()
+        self.check_http_methods()
+        self.check_outdated_software()
+        self.check_directory_listing()
+        self.check_common_vulnerabilities()
+        self.check_dns_records()
+        self.check_cookies()
+        self.check_cors_misconfiguration()
+        self.check_injection_vulnerabilities()
+        self.check_common_paths()
+        self.check_technology_fingerprint()
+        self.check_rate_limiting()
+        self.check_open_redirects()
+        self.check_form_validation()
+        
+        # Generate report
+        self.generate_report()
+    
+
+    def check_ssl_tls(self):
+        """Check SSL/TLS configuration."""
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((self.domain, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=self.domain) as ssock:
+                    cert = ssock.getpeercert()
+                    version = ssock.version()
+                    cipher = ssock.cipher()
+                    
+                    self.info.append(f"SSL/TLS Version: {version}")
+                    self.info.append(f"Cipher Suite: {cipher[0]}")
+                    
+                    # Check for weak TLS versions
+                    if version in ['SSLv3', 'TLSv1', 'TLSv1.1']:
+                        self.vulnerabilities.append({
+                            'severity': 'HIGH',
+                            'title': 'Weak TLS Version',
+                            'description': f'Website uses outdated {version}. Upgrade to TLS 1.2 or higher.',
+                            'recommendation': 'Update server to use TLS 1.2 or TLS 1.3'
+                        })
+        except Exception as e:
+            self.warnings.append(f"Could not verify SSL/TLS: {str(e)}")
+    
+    def check_security_headers(self):
+        """Check for important security headers."""
+        try:
+            response = self.session.get(self.url, timeout=5, verify=False)
+            headers = response.headers
+            
+            # Define security headers and their importance
+            required_headers = {
+                'Strict-Transport-Security': 'HIGH',
+                'X-Content-Type-Options': 'HIGH',
+                'X-Frame-Options': 'HIGH',
+                'Content-Security-Policy': 'MEDIUM',
+                'X-XSS-Protection': 'MEDIUM',
+                'Referrer-Policy': 'MEDIUM'
+            }
+            
+            for header, severity in required_headers.items():
+                if header not in headers:
+                    self.vulnerabilities.append({
+                        'severity': severity,
+                        'title': f'Missing Security Header: {header}',
+                        'description': f'The {header} header is not set.',
+                        'recommendation': f'Add {header} header to HTTP response'
+                    })
+                else:
+                    self.info.append(f"✓ {header}: {headers[header][:50]}...")
+            
+            # Check for dangerous headers
+            if 'Server' in headers:
+                self.warnings.append(f"Server header exposed: {headers['Server']}")
+            
+            if 'X-Powered-By' in headers:
+                self.warnings.append(f"X-Powered-By header exposed: {headers['X-Powered-By']}")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check security headers: {str(e)}")
+    
+    def check_http_methods(self):
+        """Check for allowed HTTP methods."""
+        try:
+            response = self.session.options(self.url, timeout=5)
+            allowed_methods = response.headers.get('Allow', '').split(',')
+            
+            dangerous_methods = ['PUT', 'DELETE', 'CONNECT', 'TRACE']
+            found_dangerous = [m.strip() for m in allowed_methods if m.strip() in dangerous_methods]
+            
+            if found_dangerous:
+                self.vulnerabilities.append({
+                    'severity': 'MEDIUM',
+                    'title': 'Dangerous HTTP Methods Allowed',
+                    'description': f'The following dangerous methods are allowed: {", ".join(found_dangerous)}',
+                    'recommendation': 'Disable dangerous HTTP methods on the server'
+                })
+            else:
+                self.info.append(f"Allowed HTTP Methods: {', '.join(allowed_methods)}")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check HTTP methods: {str(e)}")
+    
+    def check_outdated_software(self):
+        """Check for signatures of outdated software."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            content = response.text.lower()
+            headers = response.headers
+            
+            outdated_signatures = {
+                'wordpress': r'wp-content|wp-includes',
+                'joomla': r'joomla',
+                'drupal': r'drupal',
+                'apache 2.2': r'Apache/2\.2',
+                'php 5': r'PHP/5\.',
+                'jquery 1.x': r'jquery-1\.'
+            }
+            
+            for software, pattern in outdated_signatures.items():
+                if re.search(pattern, content) or re.search(pattern, str(headers)):
+                    self.info.append(f"Detected: {software} (consider updating)")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check outdated software: {str(e)}")
+    
+    def check_directory_listing(self):
+        """Check for directory listing enabled."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            
+            if 'Index of' in response.text or 'Directory' in response.text:
+                self.vulnerabilities.append({
+                    'severity': 'MEDIUM',
+                    'title': 'Directory Listing Enabled',
+                    'description': 'The server is exposing directory listings.',
+                    'recommendation': 'Disable directory listing in server configuration'
+                })
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check directory listing: {str(e)}")
+    
+    def check_common_vulnerabilities(self):
+        """Check for common vulnerability patterns."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            content = response.text
+            
+            # Check for error messages that reveal information
+            error_patterns = {
+                'SQL Error': r'SQL.*error|mysql.*error|SQL syntax',
+                'Stack Trace': r'at line|traceback|stack trace',
+                'File Paths': r'/home/\w+|/var/www|C:\\\\Users'
+            }
+            
+            for error_type, pattern in error_patterns.items():
+                if re.search(pattern, content, re.IGNORECASE):
+                    self.vulnerabilities.append({
+                        'severity': 'MEDIUM',
+                        'title': f'Information Disclosure: {error_type}',
+                        'description': f'Website may be leaking {error_type} information.',
+                        'recommendation': 'Configure proper error handling and logging'
+                    })
+            
+            # Check for common backup files
+            backup_extensions = ['.bak', '.backup', '.swp', '.tmp', '~']
+            for ext in backup_extensions:
+                try:
+                    backup_url = self.url + ext
+                    r = self.session.head(backup_url, timeout=2)
+                    if r.status_code == 200:
+                        self.vulnerabilities.append({
+                            'severity': 'HIGH',
+                            'title': 'Backup File Accessible',
+                            'description': f'Backup file found: {backup_url}',
+                            'recommendation': 'Remove backup files from web root'
+                        })
+                except:
+                    pass
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check common vulnerabilities: {str(e)}")
+    
+    def check_dns_records(self):
+        """Check DNS records."""
+        try:
+            # Get DNS records
+            try:
+                dns_a = socket.gethostbyname(self.domain)
+                self.info.append(f"DNS A Record: {dns_a}")
+            except:
+                pass
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check DNS records: {str(e)}")
+    
+    def check_cookies(self):
+        """Check for secure cookie configuration."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            cookies = response.cookies
+            
+            for cookie in cookies:
+                issues = []
+                if not cookie.secure:
+                    issues.append("not marked as Secure")
+                if not cookie.has_nonstandard_attr('HttpOnly'):
+                    issues.append("missing HttpOnly flag")
+                
+                if issues:
+                    self.vulnerabilities.append({
+                        'severity': 'MEDIUM',
+                        'title': f'Insecure Cookie: {cookie.name}',
+                        'description': f'Cookie "{cookie.name}" has security issues: {", ".join(issues)}',
+                        'recommendation': 'Set Secure and HttpOnly flags on all cookies'
+                    })
+                else:
+                    self.info.append(f"✓ Cookie {cookie.name} is properly configured")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check cookies: {str(e)}")
+    
+    def check_cors_misconfiguration(self):
+        """Check for CORS misconfiguration."""
+        try:
+            headers = {
+                'Origin': 'http://attacker.com'
+            }
+            response = self.session.get(self.url, headers=headers, timeout=5)
+            
+            if 'Access-Control-Allow-Origin' in response.headers:
+                allowed_origin = response.headers['Access-Control-Allow-Origin']
+                if allowed_origin == '*':
+                    self.vulnerabilities.append({
+                        'severity': 'HIGH',
+                        'title': 'CORS Misconfiguration - Wildcard Origin',
+                        'description': 'Access-Control-Allow-Origin is set to "*", allowing any origin to access resources.',
+                        'recommendation': 'Restrict CORS to specific trusted origins only'
+                    })
+                elif allowed_origin not in ['https://trustedomain.com']:
+                    self.info.append(f"CORS Allow-Origin: {allowed_origin}")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check CORS: {str(e)}")
+    
+    def check_injection_vulnerabilities(self):
+        """Check for common injection vulnerabilities."""
+        try:
+            # Test SQL injection vectors
+            sql_payloads = [
+                "' OR '1'='1",
+                "1' UNION SELECT NULL--",
+                "admin' --"
+            ]
+            
+            test_params = {'id': '', 'search': '', 'q': '', 'name': ''}
+            
+            for param_name in test_params:
+                for payload in sql_payloads:
+                    try:
+                        test_params[param_name] = payload
+                        response = self.session.get(self.url, params=test_params, timeout=3)
+                        
+                        # Look for SQL error messages
+                        if any(error in response.text.lower() for error in ['sql', 'syntax', 'mysql', 'error']):
+                            self.vulnerabilities.append({
+                                'severity': 'CRITICAL',
+                                'title': 'Potential SQL Injection',
+                                'description': f'Parameter "{param_name}" may be vulnerable to SQL injection.',
+                                'recommendation': 'Use parameterized queries and prepared statements'
+                            })
+                            break
+                    except:
+                        pass
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check injection vulnerabilities: {str(e)}")
+    
+    def check_common_paths(self):
+        """Check for access to common sensitive paths."""
+        common_paths = [
+            '/admin', '/admin.php', '/administrator', '/wp-admin',
+            '/config', '/config.php', '.git', '/.env', '/web.config',
+            '/robots.txt', '/sitemap.xml', '/.htaccess',
+            '/backup', '/bak', '/test', '/debug'
+        ]
+        
+        try:
+            found_paths = []
+            for path in common_paths:
+                try:
+                    test_url = self.url.rstrip('/') + path
+                    response = self.session.head(test_url, timeout=2, allow_redirects=False)
+                    if response.status_code in [200, 301, 302, 403]:
+                        found_paths.append((path, response.status_code))
+                except:
+                    pass
+            
+            if found_paths:
+                severity = 'MEDIUM' if any(code == 403 for _, code in found_paths) else 'HIGH'
+                self.vulnerabilities.append({
+                    'severity': severity,
+                    'title': 'Sensitive Paths Accessible',
+                    'description': f'Found accessible paths: {", ".join([p[0] for p in found_paths])}',
+                    'recommendation': 'Restrict access to sensitive directories and files'
+                })
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check common paths: {str(e)}")
+    
+    def check_technology_fingerprint(self):
+        """Fingerprint technologies used."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            content = response.text
+            headers = response.headers
+            
+            # Detect technologies
+            tech_patterns = {
+                'WordPress': [r'wp-content', r'wp-includes', r'wordpress'],
+                'Joomla': [r'joomla', r'/components/'],
+                'Drupal': [r'drupal', r'/sites/default/'],
+                'ASP.NET': [r'\.aspx', r'ASP\.NET', r'System\.Web'],
+                'Java': [r'\.jsp', r'JSESSIONID'],
+                'Python': [r'Django', r'Flask', r'Python'],
+                'Node.js': [r'Node\.js', r'Express'],
+                'PHP': [r'\.php', r'PHP/'],
+                'Bootstrap': [r'bootstrap\.css', r'bootstrap\.js'],
+                'jQuery': [r'jquery', r'\.js'],
+                'Angular': [r'angular\.js', r'ng-'],
+                'React': [r'react\.js', r'__react'],
+                'Vue': [r'vue\.js', r'__vue__']
+            }
+            
+            detected_tech = []
+            for tech, patterns in tech_patterns.items():
+                for pattern in patterns:
+                    if re.search(pattern, content + str(headers), re.IGNORECASE):
+                        detected_tech.append(tech)
+                        break
+            
+            if detected_tech:
+                self.info.append(f"Detected Technologies: {', '.join(set(detected_tech))}")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not fingerprint technologies: {str(e)}")
+    
+    def check_rate_limiting(self):
+        """Check if rate limiting is implemented."""
+        try:
+            responses = []
+            for i in range(10):
+                try:
+                    response = self.session.get(self.url, timeout=2)
+                    responses.append(response.status_code)
+                except:
+                    pass
+            
+            # Check if all requests succeeded (no 429 Too Many Requests)
+            if all(code in [200, 301, 302] for code in responses):
+                self.vulnerabilities.append({
+                    'severity': 'LOW',
+                    'title': 'No Rate Limiting Detected',
+                    'description': 'Website does not appear to implement rate limiting.',
+                    'recommendation': 'Implement rate limiting to prevent abuse and DoS attacks'
+                })
+            else:
+                self.info.append("✓ Rate limiting appears to be implemented")
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check rate limiting: {str(e)}")
+    
+    def check_open_redirects(self):
+        """Check for open redirect vulnerabilities."""
+        try:
+            redirect_params = ['url', 'redirect', 'return', 'returnurl', 'target']
+            
+            for param in redirect_params:
+                try:
+                    test_url = f"{self.url}?{param}=http://attacker.com"
+                    response = self.session.get(test_url, timeout=3, allow_redirects=False)
+                    
+                    if response.status_code in [301, 302, 303, 307]:
+                        if 'Location' in response.headers and 'attacker.com' in response.headers['Location']:
+                            self.vulnerabilities.append({
+                                'severity': 'MEDIUM',
+                                'title': 'Open Redirect Vulnerability',
+                                'description': f'Parameter "{param}" may allow redirects to external sites.',
+                                'recommendation': 'Validate redirect URLs against a whitelist'
+                            })
+                except:
+                    pass
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check open redirects: {str(e)}")
+    
+    def check_form_validation(self):
+        """Check for client-side form validation vulnerabilities."""
+        try:
+            response = self.session.get(self.url, timeout=5)
+            content = response.text
+            
+            issues = []
+            
+            # Check for forms without CSRF protection
+            if '<form' in content.lower() and 'csrf' not in content.lower() and 'token' not in content.lower():
+                issues.append('Forms may lack CSRF protection')
+            
+            # Check for forms with method=get for sensitive operations
+            if re.search(r'<form[^>]*method\s*=\s*[\'"]get[\'"]', content, re.IGNORECASE):
+                issues.append('Forms use GET method (sensitive data in URL)')
+            
+            # Check for autocomplete on password fields
+            if re.search(r'<input[^>]*type\s*=\s*[\'"]password[\'"][^>]*autocomplete\s*=\s*[\'"]on[\'"]', content, re.IGNORECASE):
+                issues.append('Password fields have autocomplete enabled')
+            
+            if issues:
+                self.vulnerabilities.append({
+                    'severity': 'MEDIUM',
+                    'title': 'Form Validation Issues',
+                    'description': '; '.join(issues),
+                    'recommendation': 'Implement CSRF tokens, use POST for sensitive forms, disable autocomplete on passwords'
+                })
+        
+        except Exception as e:
+            self.warnings.append(f"Could not check form validation: {str(e)}")
+    
+    def generate_report(self):
+        """Generate and display the vulnerability report."""
+        print("\n" + "=" * 70)
+        print("VULNERABILITY REPORT")
+        print("=" * 70 + "\n")
+        
+        # Critical and High vulnerabilities
+        critical_high = [v for v in self.vulnerabilities if v['severity'] in ['CRITICAL', 'HIGH']]
+        if critical_high:
+            print("🔴 CRITICAL / HIGH SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(critical_high, 1):
+                print(f"\n[{i}] {vuln['severity']} - {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Fix: {vuln['recommendation']}")
+        
+        # Medium vulnerabilities
+        medium = [v for v in self.vulnerabilities if v['severity'] == 'MEDIUM']
+        if medium:
+            print("\n\n🟡 MEDIUM SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(medium, 1):
+                print(f"\n[{i}] {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Fix: {vuln['recommendation']}")
+        
+        # Low vulnerabilities
+        low = [v for v in self.vulnerabilities if v['severity'] == 'LOW']
+        if low:
+            print("\n\n🟢 LOW SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(low, 1):
+                print(f"\n[{i}] {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Fix: {vuln['recommendation']}")
+        
+        # Warnings
+        if self.warnings:
+            print("\n\n⚠️  WARNINGS\n")
+            print("-" * 70)
+            for warning in self.warnings:
+                print(f"  • {warning}")
+        
+        # Info
+        if self.info:
+            print("\n\n✓ POSITIVE FINDINGS\n")
+            print("-" * 70)
+            for info in self.info:
+                print(f"  • {info}")
+        
+        # Summary
+        print("\n\n" + "=" * 70)
+        print("SUMMARY & DETAILED VULNERABILITY ANALYSIS")
+        print("=" * 70)
+        
+        print("\n📊 VULNERABILITY STATISTICS\n")
+        print(f"Total Vulnerabilities Found: {len(self.vulnerabilities)}")
+        print(f"  • Critical/High: {len(critical_high)}")
+        print(f"  • Medium: {len(medium)}")
+        print(f"  • Low: {len(low)}")
+        print(f"Total Warnings: {len(self.warnings)}")
+        print(f"Positive Findings: {len(self.info)}")
+        
+        # Risk score
+        risk_score = (len(critical_high) * 10) + (len(medium) * 5) + (len(low) * 2)
+        if risk_score == 0:
+            rating = "🟢 LOW RISK"
+        elif risk_score < 20:
+            rating = "🟡 MEDIUM RISK"
+        elif risk_score < 50:
+            rating = "🟠 HIGH RISK"
+        else:
+            rating = "🔴 CRITICAL RISK"
+        
+        print(f"\nOverall Risk Rating: {rating} (Score: {risk_score})")
+        
+        # Detailed vulnerability explanations sorted by severity
+        if self.vulnerabilities:
+            print("\n" + "-" * 70)
+            print("📋 ALL VULNERABILITIES - DETAILED BREAKDOWN (Ranked by Danger)\n")
+            
+            # Define severity ranking (higher number = more dangerous)
+            severity_rank = {
+                'CRITICAL': 4,
+                'HIGH': 3,
+                'MEDIUM': 2,
+                'LOW': 1
+            }
+            
+            # Sort vulnerabilities by severity (descending - most dangerous first)
+            sorted_vulns = sorted(self.vulnerabilities, key=lambda v: severity_rank.get(v['severity'], 0), reverse=True)
+            
+            for i, vuln in enumerate(sorted_vulns, 1):
+                severity_icon = {
+                    'CRITICAL': '🔴',
+                    'HIGH': '🔴',
+                    'MEDIUM': '🟡',
+                    'LOW': '🟢'
+                }.get(vuln['severity'], '⚪')
+                
+                print(f"\n[{i}] {severity_icon} {vuln['severity']} - {vuln['title']}")
+                print(f"    Location/Check: {vuln['description']}")
+                print(f"    Impact: This vulnerability was found during security analysis.")
+                print(f"    Remediation: {vuln['recommendation']}")
+        
+        print("\n" + "=" * 70)
+        print(f"Scan Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70 + "\n")
+        
+
+
+def main():
+    """Main entry point."""
+    print("\n" + "=" * 70)
+    print("NOSEY - Website Vulnerability Scanner")
+    print("=" * 70)
+    print("\n⚠️  IMPORTANT: Only scan websites you own or have permission to test!")
+    print("Unauthorized scanning is illegal.\n")
+    
+    # Check if URL was provided as command-line argument
+    if len(sys.argv) > 1:
+        url = sys.argv[1]
+    else:
+        url = input("Enter website URL to scan (e.g., https://example.com): ").strip()
+    
+    if not url:
+        print("Error: URL cannot be empty")
+        return
+    
+    # Ensure URL has protocol
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    # Disable SSL warnings for testing
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    try:
+        scanner = VulnerabilityScanner(url)
+        scanner.scan()
+    except KeyboardInterrupt:
+        print("\n\nScan cancelled by user.\n")
+    except Exception as e:
+        print(f"\nError during scan: {e}\n")
+
+if __name__ == "__main__":
+    main()
