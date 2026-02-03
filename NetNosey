@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+NetNosey - Network Vulnerability Scanner
+Scans networks via IP address for open ports, services, and security vulnerabilities.
+"""
+
+import socket
+import threading
+import sys
+import os
+from datetime import datetime
+from ipaddress import ip_network, ip_address
+import json
+try:
+    import nmap
+    NMAP_AVAILABLE = True
+except ImportError:
+    NMAP_AVAILABLE = False
+
+class NetworkScanner:
+    def __init__(self, target):
+        """Initialize scanner with target IP or network."""
+        self.target = target
+        self.vulnerabilities = []
+        self.warnings = []
+        self.info = []
+        self.open_ports = []
+        self.services = {}
+        self.lock = threading.Lock()
+    
+    def is_valid_ip(self, ip_str):
+        """Check if string is a valid IP address."""
+        try:
+            ip_address(ip_str)
+            return True
+        except ValueError:
+            return False
+    
+    def is_valid_network(self, network_str):
+        """Check if string is a valid network CIDR."""
+        try:
+            ip_network(network_str, strict=False)
+            return True
+        except ValueError:
+            return False
+    
+    def get_hosts_from_network(self, network_str):
+        """Get list of hosts from network CIDR notation."""
+        try:
+            network = ip_network(network_str, strict=False)
+            # Return first 256 hosts for safety (don't scan entire /8 or /16)
+            hosts = []
+            for host in network.hosts():
+                hosts.append(str(host))
+                if len(hosts) >= 256:
+                    break
+            return hosts
+        except ValueError:
+            return [network_str]
+    
+    def scan(self):
+        """Run all network vulnerability checks."""
+        print("\n" + "=" * 70)
+        print("NETNOSEY - NETWORK VULNERABILITY SCANNER")
+        print("=" * 70)
+        print(f"Target: {self.target}")
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70 + "\n")
+        
+        # Parse target (could be single IP or network)
+        if self.is_valid_network(self.target):
+            print(f"Target is a network. Scanning hosts...\n")
+            hosts = self.get_hosts_from_network(self.target)
+            print(f"Found {len(hosts)} hosts to scan\n")
+        elif self.is_valid_ip(self.target):
+            hosts = [self.target]
+            print(f"Target is a single IP address\n")
+        else:
+            print(f"Error: {self.target} is not a valid IP address or network")
+            return
+        
+        print("Performing comprehensive network vulnerability scan...\n")
+        
+        # Run all checks
+        self.check_host_availability(hosts)
+        self.check_common_ports(hosts)
+        self.check_open_ports(hosts)
+        self.check_service_detection()
+        self.check_network_vulnerabilities(hosts)
+        self.check_weak_services()
+        self.check_dns_resolution(hosts)
+        self.check_rce_vulnerabilities()
+        
+        # Generate report
+        self.generate_report()
+    
+    def check_host_availability(self, hosts):
+        """Check which hosts are alive on the network."""
+        print("Checking host availability...")
+        alive_hosts = []
+        
+        for host in hosts[:50]:  # Limit to first 50 for speed
+            try:
+                result = os.system(f"ping -c 1 -W 1 {host} > /dev/null 2>&1")
+                if result == 0:
+                    alive_hosts.append(host)
+                    self.info.append(f"✓ Host {host} is online")
+            except:
+                pass
+        
+        if not alive_hosts:
+            self.warnings.append("No hosts found to be online in the network range")
+        else:
+            self.info.append(f"Found {len(alive_hosts)} online hosts")
+    
+    def check_common_ports(self, hosts):
+        """Scan common ports for open services."""
+        print("Scanning common ports...")
+        common_ports = [
+            21,    # FTP
+            22,    # SSH
+            23,    # Telnet
+            25,    # SMTP
+            53,    # DNS
+            80,    # HTTP
+            110,   # POP3
+            143,   # IMAP
+            389,   # LDAP
+            443,   # HTTPS
+            445,   # SMB
+            3306,  # MySQL
+            3389,  # RDP
+            5432,  # PostgreSQL
+            5900,  # VNC
+            8080,  # HTTP Alt
+            8443,  # HTTPS Alt
+            27017, # MongoDB
+            6379,  # Redis
+        ]
+        
+        threads = []
+        for host in hosts[:20]:  # Limit to first 20 for speed
+            for port in common_ports:
+                thread = threading.Thread(
+                    target=self.scan_port,
+                    args=(host, port)
+                )
+                thread.daemon = True
+                threads.append(thread)
+                thread.start()
+        
+        # Wait for all threads
+        for thread in threads:
+            thread.join(timeout=30)
+    
+    def scan_port(self, host, port):
+        """Scan a single port."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((host, port))
+            
+            if result == 0:
+                with self.lock:
+                    self.open_ports.append((host, port))
+                    service_name = socket.getservbyport(port)
+                    self.services[f"{host}:{port}"] = service_name
+                    self.info.append(f"✓ Port {port} OPEN on {host} ({service_name})")
+            
+            sock.close()
+        except:
+            pass
+    
+    def check_open_ports(self, hosts):
+        """Check for open ports that shouldn't be open."""
+        if not self.open_ports:
+            self.info.append("No open ports detected")
+            return
+        
+        # Known risky ports
+        risky_ports = {
+            21: 'FTP - Unencrypted file transfer',
+            23: 'Telnet - Unencrypted remote access',
+            3389: 'RDP - Remote Desktop Protocol',
+            445: 'SMB - Windows file sharing (ransomware vector)',
+            27017: 'MongoDB - NoSQL database (often unprotected)',
+            6379: 'Redis - In-memory database (often unprotected)',
+        }
+        
+        for host, port in self.open_ports:
+            if port in risky_ports:
+                self.vulnerabilities.append({
+                    'severity': 'HIGH',
+                    'title': f'Risky Service Open: {risky_ports[port]}',
+                    'description': f'Port {port} ({risky_ports[port]}) is open on {host}',
+                    'recommendation': 'Close this port or restrict access via firewall'
+                })
+    
+    def check_service_detection(self):
+        """Detect services and their versions."""
+        print("Detecting services...")
+        
+        for service_info, service_name in self.services.items():
+            if 'SSH' in service_name:
+                self.check_ssh_version(service_info)
+            elif 'HTTP' in service_name or 'https' in service_name:
+                self.check_http_headers(service_info)
+            elif 'FTP' in service_name:
+                self.check_ftp_version(service_info)
+    
+    def check_ssh_version(self, service_info):
+        """Check SSH version for vulnerabilities."""
+        try:
+            host, port = service_info.split(':')
+            port = int(port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((host, port))
+            banner = sock.recv(1024).decode().strip()
+            
+            if banner:
+                self.info.append(f"SSH Banner: {banner}")
+                
+                # Check for old SSH versions
+                if any(old in banner for old in ['OpenSSH_3', 'OpenSSH_4', 'OpenSSH_5']):
+                    self.vulnerabilities.append({
+                        'severity': 'HIGH',
+                        'title': 'Outdated SSH Version',
+                        'description': f'Host {host} is running an outdated SSH version: {banner}',
+                        'recommendation': 'Update SSH to the latest version'
+                    })
+            
+            sock.close()
+        except:
+            pass
+    
+    def check_http_headers(self, service_info):
+        """Check HTTP response headers for vulnerabilities."""
+        try:
+            host, port = service_info.split(':')
+            port = int(port)
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((host, port))
+            
+            # Send HTTP request
+            request = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            sock.send(request.encode())
+            
+            response = sock.recv(4096).decode()
+            sock.close()
+            
+            # Check for security headers
+            if 'Server:' in response:
+                server_line = [line for line in response.split('\n') if 'Server:' in line][0]
+                self.info.append(f"Web Server: {server_line}")
+            
+            if 'Strict-Transport-Security' not in response:
+                self.vulnerabilities.append({
+                    'severity': 'MEDIUM',
+                    'title': 'Missing Security Header: HSTS',
+                    'description': f'Host {host}:{port} is missing HSTS header',
+                    'recommendation': 'Add Strict-Transport-Security header'
+                })
+        except:
+            pass
+    
+    def check_ftp_version(self, service_info):
+        """Check FTP version for vulnerabilities."""
+        try:
+            host, port = service_info.split(':')
+            port = int(port)
+            
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect((host, port))
+            banner = sock.recv(1024).decode().strip()
+            
+            self.info.append(f"FTP Banner: {banner}")
+            
+            # FTP should not be open on modern systems
+            self.vulnerabilities.append({
+                'severity': 'HIGH',
+                'title': 'FTP Service Exposed',
+                'description': f'Host {host} is running FTP (unencrypted file transfer)',
+                'recommendation': 'Use SFTP or FTPS instead of plain FTP'
+            })
+            
+            sock.close()
+        except:
+            pass
+    
+    def check_network_vulnerabilities(self, hosts):
+        """Check for network-level vulnerabilities."""
+        print("Checking network vulnerabilities...")
+        
+        # Check for no firewall
+        if len(self.open_ports) > 5:
+            self.vulnerabilities.append({
+                'severity': 'HIGH',
+                'title': 'Many Open Ports - Possible Firewall Misconfiguration',
+                'description': f'Found {len(self.open_ports)} open ports across the network',
+                'recommendation': 'Review firewall rules and close unnecessary ports'
+            })
+        
+        # Check for default credentials services
+        for host, port in self.open_ports:
+            if port in [3306, 5432, 27017, 6379]:  # Database ports
+                self.vulnerabilities.append({
+                    'severity': 'CRITICAL',
+                    'title': 'Database Service Exposed',
+                    'description': f'Unprotected database service on {host}:{port}',
+                    'recommendation': 'Secure database behind firewall, use strong credentials'
+                })
+    
+    def check_weak_services(self):
+        """Check for inherently weak services."""
+        print("Checking for weak services...")
+        
+        weak_services = {
+            'telnet': 'Unencrypted remote access - use SSH instead',
+            'ftp': 'Unencrypted file transfer - use SFTP instead',
+            'smtp': 'May be misconfigured for relaying',
+            'snmp': 'Often uses default community strings',
+        }
+        
+        for service_tuple in self.services.values():
+            for weak_service, warning in weak_services.items():
+                if weak_service.lower() in str(service_tuple).lower():
+                    self.vulnerabilities.append({
+                        'severity': 'MEDIUM',
+                        'title': f'Weak Service Detected: {service_tuple}',
+                        'description': warning,
+                        'recommendation': f'Replace {service_tuple} with a secure alternative'
+                    })
+    
+    def check_dns_resolution(self, hosts):
+        """Check DNS resolution for the hosts."""
+        print("Checking DNS resolution...")
+        
+        for host in hosts[:10]:
+            try:
+                hostname = socket.gethostbyaddr(host)
+                self.info.append(f"✓ Reverse DNS {host}: {hostname[0]}")
+            except socket.herror:
+                self.info.append(f"No reverse DNS entry for {host}")
+            except:
+                pass
+    
+    def check_rce_vulnerabilities(self):
+        """Check for Remote Code Execution vulnerabilities."""
+        print("Checking for RCE vectors...")
+        
+        # Check for unencrypted services
+        unencrypted = [21, 23, 25, 110, 143]  # FTP, Telnet, SMTP, POP3, IMAP
+        
+        for host, port in self.open_ports:
+            if port in unencrypted:
+                self.vulnerabilities.append({
+                    'severity': 'HIGH',
+                    'title': 'Unencrypted Service',
+                    'description': f'Unencrypted service on {host}:{port} - credentials can be intercepted',
+                    'recommendation': 'Use encrypted versions (SFTP, SSH, SMTPS, POP3S, IMAPS)'
+                })
+    
+    def generate_report(self):
+        """Generate and display the network vulnerability report."""
+        print("\n" + "=" * 70)
+        print("NETWORK VULNERABILITY REPORT")
+        print("=" * 70 + "\n")
+        
+        # Separate vulnerabilities by severity
+        critical = [v for v in self.vulnerabilities if v['severity'] == 'CRITICAL']
+        high = [v for v in self.vulnerabilities if v['severity'] == 'HIGH']
+        medium = [v for v in self.vulnerabilities if v['severity'] == 'MEDIUM']
+        low = [v for v in self.vulnerabilities if v['severity'] == 'LOW']
+        
+        # Critical vulnerabilities
+        if critical:
+            print("🔴 CRITICAL VULNERABILITIES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(critical, 1):
+                print(f"\n[{i}] CRITICAL - {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Remediation: {vuln['recommendation']}")
+        
+        # High vulnerabilities
+        if high:
+            print("\n\n🔴 HIGH SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(high, 1):
+                print(f"\n[{i}] HIGH - {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Remediation: {vuln['recommendation']}")
+        
+        # Medium vulnerabilities
+        if medium:
+            print("\n\n🟡 MEDIUM SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(medium, 1):
+                print(f"\n[{i}] {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Remediation: {vuln['recommendation']}")
+        
+        # Low vulnerabilities
+        if low:
+            print("\n\n🟢 LOW SEVERITY ISSUES\n")
+            print("-" * 70)
+            for i, vuln in enumerate(low, 1):
+                print(f"\n[{i}] {vuln['title']}")
+                print(f"    Description: {vuln['description']}")
+                print(f"    Remediation: {vuln['recommendation']}")
+        
+        # Warnings
+        if self.warnings:
+            print("\n\n⚠️  WARNINGS\n")
+            print("-" * 70)
+            for warning in self.warnings:
+                print(f"  • {warning}")
+        
+        # Positive findings
+        if self.info:
+            print("\n\n✓ NETWORK INFORMATION\n")
+            print("-" * 70)
+            for info in self.info:
+                print(f"  • {info}")
+        
+        # Summary
+        print("\n\n" + "=" * 70)
+        print("SUMMARY & ANALYSIS")
+        print("=" * 70)
+        
+        print("\n📊 SCAN STATISTICS\n")
+        print(f"Open Ports Found: {len(self.open_ports)}")
+        print(f"Services Detected: {len(self.services)}")
+        print(f"Total Vulnerabilities: {len(self.vulnerabilities)}")
+        print(f"  • Critical: {len(critical)}")
+        print(f"  • High: {len(high)}")
+        print(f"  • Medium: {len(medium)}")
+        print(f"  • Low: {len(low)}")
+        print(f"Warnings: {len(self.warnings)}")
+        print(f"Information Items: {len(self.info)}")
+        
+        # Risk score
+        risk_score = (len(critical) * 15) + (len(high) * 10) + (len(medium) * 5) + (len(low) * 2)
+        if risk_score == 0:
+            rating = "🟢 LOW RISK"
+        elif risk_score < 20:
+            rating = "🟡 MEDIUM RISK"
+        elif risk_score < 50:
+            rating = "🟠 HIGH RISK"
+        else:
+            rating = "🔴 CRITICAL RISK"
+        
+        print(f"\nOverall Risk Rating: {rating} (Score: {risk_score})")
+        
+        # Detailed vulnerability explanations
+        if self.vulnerabilities:
+            print("\n" + "-" * 70)
+            print("📋 DETAILED VULNERABILITY BREAKDOWN (Ranked by Severity)\n")
+            
+            severity_rank = {
+                'CRITICAL': 4,
+                'HIGH': 3,
+                'MEDIUM': 2,
+                'LOW': 1
+            }
+            
+            sorted_vulns = sorted(self.vulnerabilities, key=lambda v: severity_rank.get(v['severity'], 0), reverse=True)
+            
+            for i, vuln in enumerate(sorted_vulns, 1):
+                severity_icon = {
+                    'CRITICAL': '🔴',
+                    'HIGH': '🔴',
+                    'MEDIUM': '🟡',
+                    'LOW': '🟢'
+                }.get(vuln['severity'], '⚪')
+                
+                print(f"\n[{i}] {severity_icon} {vuln['severity']} - {vuln['title']}")
+                print(f"    Issue: {vuln['description']}")
+                print(f"    Solution: {vuln['recommendation']}")
+        
+        print("\n" + "=" * 70)
+        print(f"Scan Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 70 + "\n")
+
+
+def main():
+    """Main entry point."""
+    print("\n" + "=" * 70)
+    print("NETNOSEY - Network Vulnerability Scanner")
+    print("=" * 70)
+    print("\n⚠️  IMPORTANT: Only scan networks you own or have permission to test!")
+    print("Unauthorized network scanning is illegal.\n")
+    
+    # Check if IP was provided as command-line argument
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+    else:
+        target = input("Enter target IP address or network (e.g., 192.168.1.0/24 or 192.168.1.1): ").strip()
+    
+    if not target:
+        print("Error: Target cannot be empty")
+        return
+    
+    try:
+        scanner = NetworkScanner(target)
+        scanner.scan()
+    except KeyboardInterrupt:
+        print("\n\nScan cancelled by user.\n")
+    except Exception as e:
+        print(f"\nError during scan: {e}\n")
+
+if __name__ == "__main__":
+    main()
