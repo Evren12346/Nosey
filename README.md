@@ -69,13 +69,49 @@ Install dependencies:
 python3 -m pip install requests
 ```
 
+## Quick Start
+
+From the repository root:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 NetNosey --help
+python3 WebNosey --help
+```
+
+The scanners will refuse to run unless you include:
+
+```bash
+--authorized
+```
+
+That flag is required as an explicit acknowledgement that you are testing systems you own or have permission to assess.
+
 ## NetNosey Usage
+
+### What NetNosey Accepts
+
+NetNosey accepts one target argument:
+
+- a single IP address
+- a hostname
+- a CIDR range
+
+Examples:
+
+- `127.0.0.1`
+- `intranet.example`
+- `192.168.1.0/24`
+
+### Simplest Run
 
 Basic example:
 
 ```bash
 python3 NetNosey 192.168.1.10 --authorized
 ```
+
+### Common NetNosey Recipes
 
 Scan a CIDR with custom output files:
 
@@ -102,6 +138,50 @@ python3 NetNosey 10.0.0.15 \
 	--ports 1-1024
 ```
 
+Use a smaller timeout and fewer workers for slower environments:
+
+```bash
+python3 NetNosey 10.0.0.15 \
+	--authorized \
+	--timeout 0.5 \
+	--workers 50
+```
+
+Cap a larger network scan for safety:
+
+```bash
+python3 NetNosey 10.10.0.0/16 \
+	--authorized \
+	--max-hosts 32
+```
+
+Run with a custom plugin directory:
+
+```bash
+python3 NetNosey 192.168.1.10 \
+	--authorized \
+	--plugin-dir nosey_plugins/net
+```
+
+### NetNosey Output
+
+NetNosey can produce:
+
+- terminal findings summary
+- JSON report via `--json-out`
+- HTML report via `--html-out`
+
+Example:
+
+```bash
+python3 NetNosey 192.168.1.10 \
+	--authorized \
+	--json-out reports/net.json \
+	--html-out reports/net.html
+```
+
+### NetNosey Flags
+
 Useful flags:
 
 - `--ports`: comma-separated ports or ranges, or `default`
@@ -112,13 +192,34 @@ Useful flags:
 - `--json-out`: write JSON report
 - `--html-out`: write HTML report
 
+## NetNosey Usage Guide
+
+1. Start with a single host before scanning a network.
+2. Use `--ports default` or a tight port set unless you have a reason to go broad.
+3. Save JSON if you want to automate review.
+4. Save HTML if you want a human-readable report for sharing.
+5. Add custom organization-specific checks as plugins.
+
 ## WebNosey Usage
+
+### What WebNosey Accepts
+
+WebNosey accepts:
+
+- a full URL such as `https://example.com`
+- a hostname such as `example.com`
+
+If you pass only a hostname, WebNosey will normalize it to HTTPS.
+
+### Simplest Run
 
 Basic example:
 
 ```bash
 python3 WebNosey https://example.com --authorized
 ```
+
+### Common WebNosey Recipes
 
 Generate reports:
 
@@ -138,12 +239,45 @@ python3 WebNosey app.internal \
 	--plugin-dir nosey_plugins/web
 ```
 
+Scan a hostname without typing the scheme:
+
+```bash
+python3 WebNosey example.com --authorized
+```
+
+Write both report formats for later review:
+
+```bash
+python3 WebNosey https://portal.example.com \
+	--authorized \
+	--json-out reports/web.json \
+	--html-out reports/web.html
+```
+
+### WebNosey Output
+
+WebNosey can produce:
+
+- terminal findings summary
+- JSON report via `--json-out`
+- HTML report via `--html-out`
+
+### WebNosey Flags
+
 Useful flags:
 
 - `--timeout`: request and TLS timeout in seconds
 - `--plugin-dir`: plugin directory override
 - `--json-out`: write JSON report
 - `--html-out`: write HTML report
+
+## WebNosey Usage Guide
+
+1. Start with the canonical external URL for the app.
+2. Save HTML output for review with non-CLI users.
+3. Save JSON output if you want to feed results into tooling.
+4. Add custom web checks as plugins for your environment.
+5. Re-run after remediation and compare findings.
 
 ## Reports
 
@@ -168,16 +302,16 @@ Each plugin should expose:
 
 ```python
 def run(context):
-		return [
-				{
-						"severity": "LOW",
-						"title": "Example finding",
-						"host": "127.0.0.1",
-						"port": 22,
-						"evidence": "Example evidence",
-						"recommendation": "Example fix",
-				}
-		]
+    return [
+        {
+            "severity": "LOW",
+            "title": "Example finding",
+            "host": "127.0.0.1",
+            "port": 22,
+            "evidence": "Example evidence",
+            "recommendation": "Example fix",
+        }
+    ]
 ```
 
 Net plugin context includes:
@@ -194,15 +328,15 @@ Each plugin should expose:
 
 ```python
 def run(context):
-		return [
-				{
-						"severity": "LOW",
-						"title": "Example finding",
-						"url": "https://example.com",
-						"evidence": "Example evidence",
-						"recommendation": "Example fix",
-				}
-		]
+    return [
+        {
+            "severity": "LOW",
+            "title": "Example finding",
+            "url": "https://example.com",
+            "evidence": "Example evidence",
+            "recommendation": "Example fix",
+        }
+    ]
 ```
 
 Web plugin context includes:
