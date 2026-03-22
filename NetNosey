@@ -1,516 +1,412 @@
 #!/usr/bin/env python3
-"""
-NetNosey - Network Vulnerability Scanner
-Scans networks via IP address for open ports, services, and security vulnerabilities.
+"""NetNosey - defensive network exposure scanner.
+
+Authorized use only. Scans hosts/CIDRs for exposed services and produces
+terminal, JSON, and optional HTML reports.
 """
 
-import socket
-import threading
-import sys
-import os
-from datetime import datetime
-from ipaddress import ip_network, ip_address
+from __future__ import annotations
+
+import argparse
+import importlib.util
 import json
-try:
-    import nmap
-    NMAP_AVAILABLE = True
-except ImportError:
-    NMAP_AVAILABLE = False
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from ipaddress import ip_address, ip_network
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 143, 389, 443, 445,
+    3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017,
+]
+
+PORT_NAMES = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
+    110: "pop3", 143: "imap", 389: "ldap", 443: "https", 445: "smb",
+    3306: "mysql", 3389: "rdp", 5432: "postgres", 5900: "vnc", 6379: "redis",
+    8080: "http-alt", 8443: "https-alt", 27017: "mongodb",
+}
+
+SEVERITY_WEIGHT = {"CRITICAL": 15, "HIGH": 10, "MEDIUM": 5, "LOW": 2}
+
+
+@dataclass
+class Finding:
+    severity: str
+    title: str
+    host: str
+    port: Optional[int]
+    evidence: str
+    recommendation: str
+    source: str = "core"
+
+
+def parse_ports(raw: str) -> List[int]:
+    if raw.strip().lower() == "default":
+        return list(DEFAULT_PORTS)
+
+    ports: List[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            if start > end:
+                start, end = end, start
+            ports.extend(range(start, end + 1))
+        else:
+            ports.append(int(token))
+
+    return [p for p in sorted(set(ports)) if 1 <= p <= 65535]
+
+
+def render_html_report(target: str, findings: List[Finding], summary: Dict[str, int]) -> str:
+    rows = []
+    for f in findings:
+        port_text = "n/a" if f.port is None else str(f.port)
+        rows.append(
+            f"<tr><td>{f.severity}</td><td>{f.title}</td><td>{f.host}</td><td>{port_text}</td>"
+            f"<td>{f.evidence}</td><td>{f.recommendation}</td><td>{f.source}</td></tr>"
+        )
+
+    rows_html = "\n".join(rows) if rows else "<tr><td colspan='7'>No findings</td></tr>"
+    return f"""<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>NetNosey Report</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 24px; background: #f8fafc; color: #111827; }}
+h1 {{ margin-bottom: 6px; }}
+.meta {{ color: #374151; margin-bottom: 18px; }}
+.grid {{ display: grid; grid-template-columns: repeat(5, minmax(100px,1fr)); gap: 8px; margin-bottom: 16px; }}
+.card {{ background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px; }}
+table {{ width: 100%; border-collapse: collapse; background: white; }}
+th, td {{ border: 1px solid #e5e7eb; padding: 8px; vertical-align: top; text-align: left; }}
+th {{ background: #f3f4f6; }}
+</style>
+</head>
+<body>
+<h1>NetNosey Defensive Scan Report</h1>
+<div class='meta'>Target: {target} | Generated: {datetime.now().isoformat(timespec='seconds')}</div>
+<div class='grid'>
+  <div class='card'><strong>Critical</strong><div>{summary.get('CRITICAL', 0)}</div></div>
+  <div class='card'><strong>High</strong><div>{summary.get('HIGH', 0)}</div></div>
+  <div class='card'><strong>Medium</strong><div>{summary.get('MEDIUM', 0)}</div></div>
+  <div class='card'><strong>Low</strong><div>{summary.get('LOW', 0)}</div></div>
+  <div class='card'><strong>Risk Score</strong><div>{summary.get('risk_score', 0)}</div></div>
+</div>
+<table>
+<thead><tr><th>Severity</th><th>Title</th><th>Host</th><th>Port</th><th>Evidence</th><th>Recommendation</th><th>Source</th></tr></thead>
+<tbody>
+{rows_html}
+</tbody>
+</table>
+</body>
+</html>"""
+
 
 class NetworkScanner:
-    def __init__(self, target):
-        """Initialize scanner with target IP or network."""
+    def __init__(self, target: str, ports: Sequence[int], timeout: float, workers: int, max_hosts: int):
         self.target = target
-        self.vulnerabilities = []
-        self.warnings = []
-        self.info = []
-        self.open_ports = []
-        self.services = {}
-        self.lock = threading.Lock()
-    
-    def is_valid_ip(self, ip_str):
-        """Check if string is a valid IP address."""
+        self.ports = sorted(set(ports))
+        self.timeout = timeout
+        self.workers = workers
+        self.max_hosts = max_hosts
+
+        self.open_ports: List[Tuple[str, int]] = []
+        self.host_to_ports: Dict[str, Set[int]] = {}
+        self.service_banners: Dict[Tuple[str, int], str] = {}
+        self.findings: List[Finding] = []
+        self.info: List[str] = []
+        self.warnings: List[str] = []
+
+    def resolve_targets(self) -> List[str]:
         try:
-            ip_address(ip_str)
-            return True
+            net = ip_network(self.target, strict=False)
+            hosts = [str(h) for h in net.hosts()][: self.max_hosts]
+            if net.num_addresses > self.max_hosts:
+                self.warnings.append(f"Host scope capped to {self.max_hosts} for safety")
+            return hosts or [str(net.network_address)]
         except ValueError:
-            return False
-    
-    def is_valid_network(self, network_str):
-        """Check if string is a valid network CIDR."""
+            pass
+
         try:
-            ip_network(network_str, strict=False)
-            return True
+            ip_address(self.target)
+            return [self.target]
         except ValueError:
-            return False
-    
-    def get_hosts_from_network(self, network_str):
-        """Get list of hosts from network CIDR notation."""
+            pass
+
+        resolved = socket.gethostbyname(self.target)
+        self.info.append(f"Resolved hostname {self.target} -> {resolved}")
+        return [resolved]
+
+    def scan_port(self, host: str, port: int) -> Optional[Tuple[str, int]]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
         try:
-            network = ip_network(network_str, strict=False)
-            # Return first 256 hosts for safety (don't scan entire /8 or /16)
-            hosts = []
-            for host in network.hosts():
-                hosts.append(str(host))
-                if len(hosts) >= 256:
-                    break
-            return hosts
-        except ValueError:
-            return [network_str]
-    
-    def scan(self):
-        """Run all network vulnerability checks."""
-        print("\n" + "=" * 70)
-        print("NETNOSEY - NETWORK VULNERABILITY SCANNER")
-        print("=" * 70)
-        print(f"Target: {self.target}")
-        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 70 + "\n")
-        
-        # Parse target (could be single IP or network)
-        if self.is_valid_network(self.target):
-            print(f"Target is a network. Scanning hosts...\n")
-            hosts = self.get_hosts_from_network(self.target)
-            print(f"Found {len(hosts)} hosts to scan\n")
-        elif self.is_valid_ip(self.target):
-            hosts = [self.target]
-            print(f"Target is a single IP address\n")
-        else:
-            print(f"Error: {self.target} is not a valid IP address or network")
-            return
-        
-        print("Performing comprehensive network vulnerability scan...\n")
-        
-        # Run all checks
-        self.check_host_availability(hosts)
-        self.check_common_ports(hosts)
-        self.check_open_ports(hosts)
-        self.check_service_detection()
-        self.check_network_vulnerabilities(hosts)
-        self.check_weak_services()
-        self.check_dns_resolution(hosts)
-        self.check_rce_vulnerabilities()
-        
-        # Generate report
-        self.generate_report()
-    
-    def check_host_availability(self, hosts):
-        """Check which hosts are alive on the network."""
-        print("Checking host availability...")
-        alive_hosts = []
-        
-        for host in hosts[:50]:  # Limit to first 50 for speed
+            if sock.connect_ex((host, port)) == 0:
+                return host, port
+            return None
+        except OSError:
+            return None
+        finally:
+            sock.close()
+
+    def port_scan(self, hosts: Sequence[str]) -> None:
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futures = [ex.submit(self.scan_port, host, port) for host in hosts for port in self.ports]
+            for future in as_completed(futures):
+                found = future.result()
+                if not found:
+                    continue
+                host, port = found
+                self.open_ports.append((host, port))
+                self.host_to_ports.setdefault(host, set()).add(port)
+
+        self.open_ports.sort(key=lambda t: (t[0], t[1]))
+
+    def grab_banner(self, host: str, port: int) -> str:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((host, port))
+            if port in {80, 8080, 443, 8443}:
+                req = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                sock.sendall(req.encode("ascii", errors="ignore"))
+            raw = sock.recv(2048)
+            return raw.decode("utf-8", errors="ignore").strip()
+        except OSError:
+            return ""
+        finally:
             try:
-                result = os.system(f"ping -c 1 -W 1 {host} > /dev/null 2>&1")
-                if result == 0:
-                    alive_hosts.append(host)
-                    self.info.append(f"✓ Host {host} is online")
-            except:
+                sock.close()
+            except Exception:
                 pass
-        
-        if not alive_hosts:
-            self.warnings.append("No hosts found to be online in the network range")
-        else:
-            self.info.append(f"Found {len(alive_hosts)} online hosts")
-    
-    def check_common_ports(self, hosts):
-        """Scan common ports for open services."""
-        print("Scanning common ports...")
-        common_ports = [
-            21,    # FTP
-            22,    # SSH
-            23,    # Telnet
-            25,    # SMTP
-            53,    # DNS
-            80,    # HTTP
-            110,   # POP3
-            143,   # IMAP
-            389,   # LDAP
-            443,   # HTTPS
-            445,   # SMB
-            3306,  # MySQL
-            3389,  # RDP
-            5432,  # PostgreSQL
-            5900,  # VNC
-            8080,  # HTTP Alt
-            8443,  # HTTPS Alt
-            27017, # MongoDB
-            6379,  # Redis
-        ]
-        
-        threads = []
-        for host in hosts[:20]:  # Limit to first 20 for speed
-            for port in common_ports:
-                thread = threading.Thread(
-                    target=self.scan_port,
-                    args=(host, port)
-                )
-                thread.daemon = True
-                threads.append(thread)
-                thread.start()
-        
-        # Wait for all threads
-        for thread in threads:
-            thread.join(timeout=30)
-    
-    def scan_port(self, host, port):
-        """Scan a single port."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            result = sock.connect_ex((host, port))
-            
-            if result == 0:
-                with self.lock:
-                    self.open_ports.append((host, port))
-                    service_name = socket.getservbyport(port)
-                    self.services[f"{host}:{port}"] = service_name
-                    self.info.append(f"✓ Port {port} OPEN on {host} ({service_name})")
-            
-            sock.close()
-        except:
-            pass
-    
-    def check_open_ports(self, hosts):
-        """Check for open ports that shouldn't be open."""
-        if not self.open_ports:
-            self.info.append("No open ports detected")
+
+    def collect_banners(self) -> None:
+        for host, port in self.open_ports:
+            if port in {21, 22, 25, 80, 443, 8080, 8443}:
+                banner = self.grab_banner(host, port)
+                if banner:
+                    self.service_banners[(host, port)] = banner
+
+    def add_finding(self, finding: Finding) -> None:
+        k = (finding.severity, finding.title, finding.host, finding.port, finding.source)
+        existing = {(f.severity, f.title, f.host, f.port, f.source) for f in self.findings}
+        if k not in existing:
+            self.findings.append(finding)
+
+    def evaluate_core_findings(self) -> None:
+        risky = {
+            23: ("HIGH", "Telnet exposed", "Disable Telnet and use SSH with key auth."),
+            21: ("HIGH", "FTP exposed", "Use SFTP/FTPS and restrict access."),
+            445: ("HIGH", "SMB exposed", "Restrict SMB to private segments and patch often."),
+            3389: ("HIGH", "RDP exposed", "Restrict RDP behind VPN and enforce MFA/NLA."),
+            27017: ("CRITICAL", "MongoDB exposed", "Enforce auth and private network binding."),
+            6379: ("CRITICAL", "Redis exposed", "Disable public exposure; require auth/TLS."),
+            3306: ("CRITICAL", "MySQL exposed", "Restrict ingress and enforce least privilege."),
+            5432: ("CRITICAL", "PostgreSQL exposed", "Restrict ingress and strong auth rules."),
+        }
+
+        for host, port in self.open_ports:
+            service = PORT_NAMES.get(port, "unknown")
+            if port in risky:
+                sev, title, fix = risky[port]
+                self.add_finding(Finding(severity=sev, title=title, host=host, port=port,
+                                         evidence=f"Open {service} on {host}:{port}", recommendation=fix))
+
+        for host, ports in self.host_to_ports.items():
+            if 80 in ports and not ({443, 8443} & ports):
+                self.add_finding(Finding(
+                    severity="MEDIUM",
+                    title="HTTP without HTTPS",
+                    host=host,
+                    port=80,
+                    evidence="Port 80 detected but HTTPS port not detected.",
+                    recommendation="Serve HTTPS and redirect HTTP to HTTPS.",
+                ))
+            if len(ports) >= 8:
+                self.add_finding(Finding(
+                    severity="MEDIUM",
+                    title="Large exposed attack surface",
+                    host=host,
+                    port=None,
+                    evidence=f"{len(ports)} open ports were detected on host.",
+                    recommendation="Disable unused services and apply host firewall policy.",
+                ))
+
+        for (host, port), banner in self.service_banners.items():
+            b = banner.lower()
+            if port == 22 and any(x in b for x in ["openssh_3", "openssh_4", "openssh_5", "openssh_6"]):
+                self.add_finding(Finding(
+                    severity="HIGH",
+                    title="Potentially outdated SSH",
+                    host=host,
+                    port=port,
+                    evidence=f"SSH banner indicates old version: {banner[:120]}",
+                    recommendation="Upgrade OpenSSH and disable weak ciphers.",
+                ))
+            if port in {80, 8080, 443, 8443} and "strict-transport-security" not in b:
+                self.add_finding(Finding(
+                    severity="LOW",
+                    title="Missing HSTS header",
+                    host=host,
+                    port=port,
+                    evidence="HSTS header not detected in sampled response.",
+                    recommendation="Add Strict-Transport-Security after HTTPS hardening.",
+                ))
+
+    def run_plugins(self, plugin_dir: Path) -> None:
+        if not plugin_dir.exists():
             return
-        
-        # Known risky ports
-        risky_ports = {
-            21: 'FTP - Unencrypted file transfer',
-            23: 'Telnet - Unencrypted remote access',
-            3389: 'RDP - Remote Desktop Protocol',
-            445: 'SMB - Windows file sharing (ransomware vector)',
-            27017: 'MongoDB - NoSQL database (often unprotected)',
-            6379: 'Redis - In-memory database (often unprotected)',
+        context = {
+            "open_ports": self.open_ports,
+            "host_to_ports": self.host_to_ports,
+            "service_banners": self.service_banners,
         }
-        
-        for host, port in self.open_ports:
-            if port in risky_ports:
-                self.vulnerabilities.append({
-                    'severity': 'HIGH',
-                    'title': f'Risky Service Open: {risky_ports[port]}',
-                    'description': f'Port {port} ({risky_ports[port]}) is open on {host}',
-                    'recommendation': 'Close this port or restrict access via firewall'
-                })
-    
-    def check_service_detection(self):
-        """Detect services and their versions."""
-        print("Detecting services...")
-        
-        for service_info, service_name in self.services.items():
-            if 'SSH' in service_name:
-                self.check_ssh_version(service_info)
-            elif 'HTTP' in service_name or 'https' in service_name:
-                self.check_http_headers(service_info)
-            elif 'FTP' in service_name:
-                self.check_ftp_version(service_info)
-    
-    def check_ssh_version(self, service_info):
-        """Check SSH version for vulnerabilities."""
-        try:
-            host, port = service_info.split(':')
-            port = int(port)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect((host, port))
-            banner = sock.recv(1024).decode().strip()
-            
-            if banner:
-                self.info.append(f"SSH Banner: {banner}")
-                
-                # Check for old SSH versions
-                if any(old in banner for old in ['OpenSSH_3', 'OpenSSH_4', 'OpenSSH_5']):
-                    self.vulnerabilities.append({
-                        'severity': 'HIGH',
-                        'title': 'Outdated SSH Version',
-                        'description': f'Host {host} is running an outdated SSH version: {banner}',
-                        'recommendation': 'Update SSH to the latest version'
-                    })
-            
-            sock.close()
-        except:
-            pass
-    
-    def check_http_headers(self, service_info):
-        """Check HTTP response headers for vulnerabilities."""
-        try:
-            host, port = service_info.split(':')
-            port = int(port)
-            
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect((host, port))
-            
-            # Send HTTP request
-            request = f"HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-            sock.send(request.encode())
-            
-            response = sock.recv(4096).decode()
-            sock.close()
-            
-            # Check for security headers
-            if 'Server:' in response:
-                server_line = [line for line in response.split('\n') if 'Server:' in line][0]
-                self.info.append(f"Web Server: {server_line}")
-            
-            if 'Strict-Transport-Security' not in response:
-                self.vulnerabilities.append({
-                    'severity': 'MEDIUM',
-                    'title': 'Missing Security Header: HSTS',
-                    'description': f'Host {host}:{port} is missing HSTS header',
-                    'recommendation': 'Add Strict-Transport-Security header'
-                })
-        except:
-            pass
-    
-    def check_ftp_version(self, service_info):
-        """Check FTP version for vulnerabilities."""
-        try:
-            host, port = service_info.split(':')
-            port = int(port)
-            
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect((host, port))
-            banner = sock.recv(1024).decode().strip()
-            
-            self.info.append(f"FTP Banner: {banner}")
-            
-            # FTP should not be open on modern systems
-            self.vulnerabilities.append({
-                'severity': 'HIGH',
-                'title': 'FTP Service Exposed',
-                'description': f'Host {host} is running FTP (unencrypted file transfer)',
-                'recommendation': 'Use SFTP or FTPS instead of plain FTP'
-            })
-            
-            sock.close()
-        except:
-            pass
-    
-    def check_network_vulnerabilities(self, hosts):
-        """Check for network-level vulnerabilities."""
-        print("Checking network vulnerabilities...")
-        
-        # Check for no firewall
-        if len(self.open_ports) > 5:
-            self.vulnerabilities.append({
-                'severity': 'HIGH',
-                'title': 'Many Open Ports - Possible Firewall Misconfiguration',
-                'description': f'Found {len(self.open_ports)} open ports across the network',
-                'recommendation': 'Review firewall rules and close unnecessary ports'
-            })
-        
-        # Check for default credentials services
-        for host, port in self.open_ports:
-            if port in [3306, 5432, 27017, 6379]:  # Database ports
-                self.vulnerabilities.append({
-                    'severity': 'CRITICAL',
-                    'title': 'Database Service Exposed',
-                    'description': f'Unprotected database service on {host}:{port}',
-                    'recommendation': 'Secure database behind firewall, use strong credentials'
-                })
-    
-    def check_weak_services(self):
-        """Check for inherently weak services."""
-        print("Checking for weak services...")
-        
-        weak_services = {
-            'telnet': 'Unencrypted remote access - use SSH instead',
-            'ftp': 'Unencrypted file transfer - use SFTP instead',
-            'smtp': 'May be misconfigured for relaying',
-            'snmp': 'Often uses default community strings',
-        }
-        
-        for service_tuple in self.services.values():
-            for weak_service, warning in weak_services.items():
-                if weak_service.lower() in str(service_tuple).lower():
-                    self.vulnerabilities.append({
-                        'severity': 'MEDIUM',
-                        'title': f'Weak Service Detected: {service_tuple}',
-                        'description': warning,
-                        'recommendation': f'Replace {service_tuple} with a secure alternative'
-                    })
-    
-    def check_dns_resolution(self, hosts):
-        """Check DNS resolution for the hosts."""
-        print("Checking DNS resolution...")
-        
-        for host in hosts[:10]:
+        for plugin_path in sorted(plugin_dir.glob("*.py")):
             try:
-                hostname = socket.gethostbyaddr(host)
-                self.info.append(f"✓ Reverse DNS {host}: {hostname[0]}")
-            except socket.herror:
-                self.info.append(f"No reverse DNS entry for {host}")
-            except:
-                pass
-    
-    def check_rce_vulnerabilities(self):
-        """Check for Remote Code Execution vulnerabilities."""
-        print("Checking for RCE vectors...")
-        
-        # Check for unencrypted services
-        unencrypted = [21, 23, 25, 110, 143]  # FTP, Telnet, SMTP, POP3, IMAP
-        
-        for host, port in self.open_ports:
-            if port in unencrypted:
-                self.vulnerabilities.append({
-                    'severity': 'HIGH',
-                    'title': 'Unencrypted Service',
-                    'description': f'Unencrypted service on {host}:{port} - credentials can be intercepted',
-                    'recommendation': 'Use encrypted versions (SFTP, SSH, SMTPS, POP3S, IMAPS)'
-                })
-    
-    def generate_report(self):
-        """Generate and display the network vulnerability report."""
-        print("\n" + "=" * 70)
-        print("NETWORK VULNERABILITY REPORT")
-        print("=" * 70 + "\n")
-        
-        # Separate vulnerabilities by severity
-        critical = [v for v in self.vulnerabilities if v['severity'] == 'CRITICAL']
-        high = [v for v in self.vulnerabilities if v['severity'] == 'HIGH']
-        medium = [v for v in self.vulnerabilities if v['severity'] == 'MEDIUM']
-        low = [v for v in self.vulnerabilities if v['severity'] == 'LOW']
-        
-        # Critical vulnerabilities
-        if critical:
-            print("🔴 CRITICAL VULNERABILITIES\n")
-            print("-" * 70)
-            for i, vuln in enumerate(critical, 1):
-                print(f"\n[{i}] CRITICAL - {vuln['title']}")
-                print(f"    Description: {vuln['description']}")
-                print(f"    Remediation: {vuln['recommendation']}")
-        
-        # High vulnerabilities
-        if high:
-            print("\n\n🔴 HIGH SEVERITY ISSUES\n")
-            print("-" * 70)
-            for i, vuln in enumerate(high, 1):
-                print(f"\n[{i}] HIGH - {vuln['title']}")
-                print(f"    Description: {vuln['description']}")
-                print(f"    Remediation: {vuln['recommendation']}")
-        
-        # Medium vulnerabilities
-        if medium:
-            print("\n\n🟡 MEDIUM SEVERITY ISSUES\n")
-            print("-" * 70)
-            for i, vuln in enumerate(medium, 1):
-                print(f"\n[{i}] {vuln['title']}")
-                print(f"    Description: {vuln['description']}")
-                print(f"    Remediation: {vuln['recommendation']}")
-        
-        # Low vulnerabilities
-        if low:
-            print("\n\n🟢 LOW SEVERITY ISSUES\n")
-            print("-" * 70)
-            for i, vuln in enumerate(low, 1):
-                print(f"\n[{i}] {vuln['title']}")
-                print(f"    Description: {vuln['description']}")
-                print(f"    Remediation: {vuln['recommendation']}")
-        
-        # Warnings
-        if self.warnings:
-            print("\n\n⚠️  WARNINGS\n")
-            print("-" * 70)
-            for warning in self.warnings:
-                print(f"  • {warning}")
-        
-        # Positive findings
-        if self.info:
-            print("\n\n✓ NETWORK INFORMATION\n")
-            print("-" * 70)
-            for info in self.info:
-                print(f"  • {info}")
-        
-        # Summary
-        print("\n\n" + "=" * 70)
-        print("SUMMARY & ANALYSIS")
-        print("=" * 70)
-        
-        print("\n📊 SCAN STATISTICS\n")
-        print(f"Open Ports Found: {len(self.open_ports)}")
-        print(f"Services Detected: {len(self.services)}")
-        print(f"Total Vulnerabilities: {len(self.vulnerabilities)}")
-        print(f"  • Critical: {len(critical)}")
-        print(f"  • High: {len(high)}")
-        print(f"  • Medium: {len(medium)}")
-        print(f"  • Low: {len(low)}")
-        print(f"Warnings: {len(self.warnings)}")
-        print(f"Information Items: {len(self.info)}")
-        
-        # Risk score
-        risk_score = (len(critical) * 15) + (len(high) * 10) + (len(medium) * 5) + (len(low) * 2)
-        if risk_score == 0:
-            rating = "🟢 LOW RISK"
-        elif risk_score < 20:
-            rating = "🟡 MEDIUM RISK"
-        elif risk_score < 50:
-            rating = "🟠 HIGH RISK"
+                spec = importlib.util.spec_from_file_location(plugin_path.stem, plugin_path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                if hasattr(module, "run"):
+                    plugin_findings = module.run(context) or []
+                    for item in plugin_findings:
+                        self.add_finding(Finding(
+                            severity=item.get("severity", "LOW"),
+                            title=item.get("title", plugin_path.stem),
+                            host=item.get("host", "unknown"),
+                            port=item.get("port"),
+                            evidence=item.get("evidence", "Plugin-reported signal"),
+                            recommendation=item.get("recommendation", "Review plugin guidance"),
+                            source=f"plugin:{plugin_path.stem}",
+                        ))
+            except Exception as exc:
+                self.warnings.append(f"Plugin {plugin_path.name} failed: {exc}")
+
+    def severity_counts(self) -> Dict[str, int]:
+        counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+        for finding in self.findings:
+            counts[finding.severity] = counts.get(finding.severity, 0) + 1
+        return counts
+
+    def risk_score(self) -> int:
+        return sum(SEVERITY_WEIGHT.get(f.severity, 0) for f in self.findings)
+
+    def as_json(self) -> Dict[str, object]:
+        summary = self.severity_counts()
+        summary["risk_score"] = self.risk_score()
+        return {
+            "target": self.target,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "open_ports": [{"host": h, "port": p, "service": PORT_NAMES.get(p, "unknown")} for h, p in self.open_ports],
+            "findings": [asdict(f) for f in self.findings],
+            "summary": summary,
+            "info": self.info,
+            "warnings": self.warnings,
+        }
+
+    def print_report(self) -> None:
+        counts = self.severity_counts()
+        print("\n" + "=" * 72)
+        print("NETNOSEY REPORT")
+        print("=" * 72)
+        if not self.findings:
+            print("No major exposure signals found in the tested scope.")
         else:
-            rating = "🔴 CRITICAL RISK"
-        
-        print(f"\nOverall Risk Rating: {rating} (Score: {risk_score})")
-        
-        # Detailed vulnerability explanations
-        if self.vulnerabilities:
-            print("\n" + "-" * 70)
-            print("📋 DETAILED VULNERABILITY BREAKDOWN (Ranked by Severity)\n")
-            
-            severity_rank = {
-                'CRITICAL': 4,
-                'HIGH': 3,
-                'MEDIUM': 2,
-                'LOW': 1
-            }
-            
-            sorted_vulns = sorted(self.vulnerabilities, key=lambda v: severity_rank.get(v['severity'], 0), reverse=True)
-            
-            for i, vuln in enumerate(sorted_vulns, 1):
-                severity_icon = {
-                    'CRITICAL': '🔴',
-                    'HIGH': '🔴',
-                    'MEDIUM': '🟡',
-                    'LOW': '🟢'
-                }.get(vuln['severity'], '⚪')
-                
-                print(f"\n[{i}] {severity_icon} {vuln['severity']} - {vuln['title']}")
-                print(f"    Issue: {vuln['description']}")
-                print(f"    Solution: {vuln['recommendation']}")
-        
-        print("\n" + "=" * 70)
-        print(f"Scan Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 70 + "\n")
+            rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            ordered = sorted(self.findings, key=lambda f: rank.get(f.severity, 0), reverse=True)
+            for i, f in enumerate(ordered, 1):
+                port = "n/a" if f.port is None else str(f.port)
+                print(f"\n[{i}] {f.severity} - {f.title}")
+                print(f"Host/Port: {f.host}:{port}")
+                print(f"Evidence: {f.evidence}")
+                print(f"Fix: {f.recommendation}")
+                if f.source != "core":
+                    print(f"Source: {f.source}")
+
+        print("\nSummary")
+        print(f"Open ports: {len(self.open_ports)}")
+        print(f"Findings: {len(self.findings)}")
+        print(f"Critical: {counts['CRITICAL']}  High: {counts['HIGH']}  Medium: {counts['MEDIUM']}  Low: {counts['LOW']}")
+        print(f"Risk score: {self.risk_score()}")
 
 
-def main():
-    """Main entry point."""
-    print("\n" + "=" * 70)
-    print("NETNOSEY - Network Vulnerability Scanner")
-    print("=" * 70)
-    print("\n⚠️  IMPORTANT: Only scan networks you own or have permission to test!")
-    print("Unauthorized network scanning is illegal.\n")
-    
-    # Check if IP was provided as command-line argument
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
-    else:
-        target = input("Enter target IP address or network (e.g., 192.168.1.0/24 or 192.168.1.1): ").strip()
-    
-    if not target:
-        print("Error: Target cannot be empty")
-        return
-    
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="NetNosey defensive network scanner")
+    parser.add_argument("target", help="IP, hostname, or CIDR target")
+    parser.add_argument("--ports", default="default", help="Port list, e.g. '22,80,443' or '1-1024'")
+    parser.add_argument("--timeout", type=float, default=1.0)
+    parser.add_argument("--workers", type=int, default=200)
+    parser.add_argument("--max-hosts", type=int, default=64)
+    parser.add_argument("--plugin-dir", default=str(SCRIPT_DIR / "nosey_plugins" / "net"))
+    parser.add_argument("--json-out")
+    parser.add_argument("--html-out")
+    parser.add_argument("--authorized", action="store_true", help="Required: confirm authorized testing")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if not args.authorized:
+        print("Refusing to run without --authorized acknowledgement.")
+        return 2
+
+    ports = parse_ports(args.ports)
+    if not ports:
+        print("No valid ports supplied.")
+        return 2
+
+    scanner = NetworkScanner(
+        target=args.target,
+        ports=ports,
+        timeout=max(0.1, args.timeout),
+        workers=max(4, args.workers),
+        max_hosts=max(1, args.max_hosts),
+    )
+
+    print("\nNetNosey: scanning authorized target...")
+    print(f"Target: {args.target}")
+    print(f"Ports: {len(ports)}")
+
     try:
-        scanner = NetworkScanner(target)
-        scanner.scan()
+        hosts = scanner.resolve_targets()
+        scanner.port_scan(hosts)
+        scanner.collect_banners()
+        scanner.evaluate_core_findings()
+        scanner.run_plugins(Path(args.plugin_dir))
+        scanner.print_report()
     except KeyboardInterrupt:
-        print("\n\nScan cancelled by user.\n")
-    except Exception as e:
-        print(f"\nError during scan: {e}\n")
+        print("\nScan cancelled by user.")
+        return 130
+    except Exception as exc:
+        print(f"Scan failed: {exc}")
+        return 1
+
+    payload = scanner.as_json()
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"JSON report written to {args.json_out}")
+    if args.html_out:
+        summary = scanner.severity_counts()
+        summary["risk_score"] = scanner.risk_score()
+        html = render_html_report(scanner.target, scanner.findings, summary)
+        Path(args.html_out).write_text(html, encoding="utf-8")
+        print(f"HTML report written to {args.html_out}")
+
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

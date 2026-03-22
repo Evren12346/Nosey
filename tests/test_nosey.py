@@ -1,0 +1,65 @@
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+def load_module(path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[path.stem] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class NoseyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        base = Path(__file__).resolve().parent.parent
+        cls.net = load_module(base / "netNosey.py")
+        cls.web = load_module(base / "webNosey.py")
+
+    def test_parse_ports_mixed(self):
+        ports = self.net.parse_ports("22,80,443,1000-1002")
+        self.assertEqual(ports, [22, 80, 443, 1000, 1001, 1002])
+
+    def test_parse_ports_default(self):
+        ports = self.net.parse_ports("default")
+        self.assertIn(22, ports)
+        self.assertIn(443, ports)
+
+    def test_normalize_url(self):
+        self.assertEqual(self.web.normalize_url("example.com"), "https://example.com")
+        self.assertEqual(self.web.normalize_url("http://example.com"), "http://example.com")
+
+    def test_html_report_generation(self):
+        finding = self.net.Finding(
+            severity="HIGH",
+            title="Test",
+            host="127.0.0.1",
+            port=22,
+            evidence="demo",
+            recommendation="fix",
+        )
+        html = self.net.render_html_report("127.0.0.1", [finding], {"HIGH": 1, "risk_score": 10})
+        self.assertIn("NetNosey Defensive Scan Report", html)
+        self.assertIn("127.0.0.1", html)
+        self.assertIn("HIGH", html)
+
+    def test_plugin_loading_net(self):
+        scanner = self.net.NetworkScanner("127.0.0.1", [22], timeout=0.1, workers=4, max_hosts=1)
+        scanner.open_ports = [("127.0.0.1", 22)]
+        with tempfile.TemporaryDirectory() as tmp:
+            plugin = Path(tmp) / "demo.py"
+            plugin.write_text(
+                "def run(context):\n"
+                "    return [{'severity':'LOW','title':'Plugin Hit','host':'127.0.0.1','port':22,'evidence':'ok','recommendation':'ok'}]\n",
+                encoding="utf-8",
+            )
+            scanner.run_plugins(Path(tmp))
+        self.assertTrue(any(f.title == "Plugin Hit" for f in scanner.findings))
+
+
+if __name__ == "__main__":
+    unittest.main()
