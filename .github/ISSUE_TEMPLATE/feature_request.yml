@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a scanner improvement, report enhancement, or plugin idea.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for defensive feature ideas only.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or gap
+      description: What limitation are you hitting today?
+      placeholder: Describe the operator or maintainer pain point.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should the repo do instead?
+      placeholder: Describe the feature, check, workflow, or output you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: Any workarounds or competing ideas.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - NetNosey
+        - WebNosey
+        - Plugins
+        - Tests
+        - CI / Automation
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      placeholder: Links, references, examples, or constraints.

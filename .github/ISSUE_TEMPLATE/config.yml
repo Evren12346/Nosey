@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Repository README
+    url: https://github.com/Evren12346/Nosey#readme
+    about: Check installation, usage, plugins, and CI guidance before opening an issue.
