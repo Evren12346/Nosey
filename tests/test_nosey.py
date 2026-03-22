@@ -1,3 +1,4 @@
+import importlib.machinery
 import importlib.util
 import sys
 import tempfile
@@ -6,7 +7,8 @@ from pathlib import Path
 
 
 def load_module(path):
-    spec = importlib.util.spec_from_file_location(path.stem, path)
+    loader = importlib.machinery.SourceFileLoader(path.stem, str(path))
+    spec = importlib.util.spec_from_loader(path.stem, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[path.stem] = module
     spec.loader.exec_module(module)
@@ -17,8 +19,16 @@ class NoseyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         base = Path(__file__).resolve().parent.parent
-        cls.net = load_module(base / "netNosey.py")
-        cls.web = load_module(base / "webNosey.py")
+        net_path = base / "NetNosey"
+        if not net_path.exists():
+            net_path = base / "netNosey.py"
+
+        web_path = base / "WebNosey"
+        if not web_path.exists():
+            web_path = base / "webNosey.py"
+
+        cls.net = load_module(net_path)
+        cls.web = load_module(web_path)
 
     def test_parse_ports_mixed(self):
         ports = self.net.parse_ports("22,80,443,1000-1002")

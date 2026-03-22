@@ -55,6 +55,12 @@ Both scanners require an explicit authorization flag before they run:
 - Python 3.10+
 - `requests`
 
+Repository dependency file:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 Install dependencies:
 
 ```bash
@@ -217,6 +223,16 @@ Current tests cover:
 - URL normalization
 - HTML report generation
 - plugin loading
+
+## Continuous Integration
+
+GitHub Actions now runs the repository test workflow on pushes and pull requests.
+
+The workflow currently:
+
+- installs Python dependencies from `requirements.txt`
+- runs `tests/test_nosey.py`
+- performs CLI smoke checks for `NetNosey` and `WebNosey`
 
 ## Example Workflow
 
