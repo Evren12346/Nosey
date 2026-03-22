@@ -1,5 +1,7 @@
 # Nosey
 
+[![Python Tests](https://github.com/Evren12346/Nosey/actions/workflows/python-tests.yml/badge.svg)](https://github.com/Evren12346/Nosey/actions/workflows/python-tests.yml)
+
 Defensive security scanners for authorized assessments.
 
 Nosey currently includes two command-line tools:
@@ -230,9 +232,11 @@ GitHub Actions now runs the repository test workflow on pushes and pull requests
 
 The workflow currently:
 
+- runs `ruff check` against the scanners, plugins, and tests
 - installs Python dependencies from `requirements.txt`
 - runs `tests/test_nosey.py`
 - performs CLI smoke checks for `NetNosey` and `WebNosey`
+- verifies fixture-based plugin loading paths used in the test suite
 
 ## Example Workflow
 

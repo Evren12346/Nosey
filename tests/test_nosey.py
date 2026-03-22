@@ -1,7 +1,6 @@
 import importlib.machinery
 import importlib.util
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,6 +18,7 @@ class NoseyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         base = Path(__file__).resolve().parent.parent
+        cls.base = base
         net_path = base / "NetNosey"
         if not net_path.exists():
             net_path = base / "netNosey.py"
@@ -60,15 +60,18 @@ class NoseyTests(unittest.TestCase):
     def test_plugin_loading_net(self):
         scanner = self.net.NetworkScanner("127.0.0.1", [22], timeout=0.1, workers=4, max_hosts=1)
         scanner.open_ports = [("127.0.0.1", 22)]
-        with tempfile.TemporaryDirectory() as tmp:
-            plugin = Path(tmp) / "demo.py"
-            plugin.write_text(
-                "def run(context):\n"
-                "    return [{'severity':'LOW','title':'Plugin Hit','host':'127.0.0.1','port':22,'evidence':'ok','recommendation':'ok'}]\n",
-                encoding="utf-8",
-            )
-            scanner.run_plugins(Path(tmp))
+        scanner.run_plugins(self.base / "tests" / "fixtures" / "net")
         self.assertTrue(any(f.title == "Plugin Hit" for f in scanner.findings))
+
+    def test_plugin_loading_web(self):
+        scanner = self.web.WebScanner("https://example.com", timeout=1.0)
+
+        class FakeResponse:
+            headers = {"Cache-Control": "public"}
+
+        scanner.fetch = lambda *args, **kwargs: FakeResponse()
+        scanner.run_plugins(self.base / "tests" / "fixtures" / "web")
+        self.assertTrue(any(f.title == "Fixture Web Plugin Hit" for f in scanner.findings))
 
 
 if __name__ == "__main__":
